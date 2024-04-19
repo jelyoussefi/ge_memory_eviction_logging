@@ -1,0 +1,14 @@
+#!/bin/bash
+hp_mem_ratio=$1
+source /opt/intel/oneapi/setvars.sh --force 
+./kernelCompiler 2> /dev/null
+
+./gpuMemEvictTestTool -m 1.0  -t 20 &
+
+sleep 5
+
+./gpuMemEvictTestTool -m $hp_mem_ratio  -t 10 -h  
+
+sleep 5 
+
+

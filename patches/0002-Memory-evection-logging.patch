@@ -1,0 +1,352 @@
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c
+index 56ed2d8..7c4aab3 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c
+@@ -1158,10 +1158,7 @@ static int eb_lock_vmas(struct i915_execbuffer *eb)
+ 		if (err)
+ 			return err;
+ 	}
+-
+-	if (pid > 0)
+-		i915_send_uevent(eb->i915, "RUN=%d", pid);
+-
++	
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_lmem.c b/drivers/gpu/drm/i915/gem/i915_gem_lmem.c
+index 184b7c5..e1667cd 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_lmem.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_lmem.c
+@@ -21,6 +21,7 @@
+ #include "i915_gem_region.h"
+ #include "i915_sw_fence.h"
+ #include "intel_memory_region.h"
++#include "i915_sysfs.h"
+ 
+ static u32 *emit_timestamp(struct i915_request *rq, u32 *cs, int gpr)
+ {
+@@ -336,9 +337,11 @@ lmem_swapout(struct drm_i915_gem_object *obj,
+ 	/* copying the pages */
+ 	if (i915->params.enable_eviction >= 2 &&
+ 	    !intel_gt_is_wedged(obj->mm.region.mem->gt)) {
++	    	uint64_t start_time = ktime_get_real_ns();
+ 		dst = i915_window_blt_copy_swapout(src, HAS_FLAT_CCS(i915));
+ 		if (!IS_ERR(dst)) {
+ 			stat = &i915->mm.blt_swap_stats.out;
++			i915_send_uevent(i915, obj->task, "SWAPOUT", sizes/1024, (ktime_get_real_ns() - start_time)/1000);
+ 			err = 0;
+ 		} else {
+ 			err = -EIO;
+@@ -395,9 +398,12 @@ lmem_swapin(struct drm_i915_gem_object *obj,
+ 	/* copying the pages */
+ 	if (i915->params.enable_eviction >= 2 &&
+ 	    !intel_gt_is_wedged(obj->mm.region.mem->gt)) {
++	    	uint64_t start_time = ktime_get_real_ns();
+ 		err = i915_window_blt_copy_swapin(dst, src, HAS_FLAT_CCS(i915));
+-		if (!err)
++		if (!err) {
+ 			stat = &i915->mm.blt_swap_stats.in;
++			i915_send_uevent(i915, obj->task, "SWAPIN", sizes/1024, (ktime_get_real_ns() - start_time)/1000);
++		}
+ 	}
+ 
+ 	__i915_gem_object_unpin_pages(dst);
+@@ -407,6 +413,11 @@ lmem_swapin(struct drm_i915_gem_object *obj,
+ 
+ 	if (!err) {
+ 		obj->swapto1 = NULL;
++		if ( obj->suspended ) {
++			obj->suspended = false;
++			i915_send_uevent(i915, obj->task, "RESUME", 0, 0);
++		}
++
+ 
+ 		free_shm_obj(src);
+ 	} else {
+@@ -762,8 +773,13 @@ static int lmem_get_pages(struct drm_i915_gem_object *obj)
+ 	int err;
+ 
+ 	pages = i915_gem_object_get_pages_buddy(obj, &page_sizes);
+-	if (IS_ERR(pages))
++	if (IS_ERR(pages)) {
++		if (PTR_ERR(pages) == -EAGAIN && obj->swapto1 && !obj->suspended) {
++			obj->suspended = true;
++			i915_send_uevent(to_i915(obj->base.dev), obj->task, "SUSPEND", 0, 0);
++		}
+ 		return PTR_ERR(pages);
++	}
+ 
+ 	if (obj->swapto1)
+ 		err = lmem_swapin(obj, pages, page_sizes);
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_mman.c b/drivers/gpu/drm/i915/gem/i915_gem_mman.c
+index 0aac4da..609484f 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_mman.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_mman.c
+@@ -271,11 +271,6 @@ static vm_fault_t vm_fault_cpu(struct vm_fault *vmf)
+ 
+ 	trace_i915_gem_object_fault(obj, vmf->address, page_offset, false, write);
+ 
+-	if (NULL != obj->task) {
+-		pid_t pid = obj->task->pid;
+-		i915_send_uevent(i915, "RUN=%d", pid);
+-	}
+-
+ 	atomic_inc(&i915->active_fault_handlers);
+ 
+ 	/* Do not service faults if invalidate_lmem_mmaps is set */
+@@ -331,11 +326,6 @@ out:
+ 	if (atomic_dec_and_test(&i915->active_fault_handlers))
+ 		wake_up_var(&i915->active_fault_handlers);
+ 
+-	if (NULL != obj->task) {
+-		pid_t pid = obj->task->pid;
+-		i915_send_uevent(i915, "STOP=%d", pid);
+-	}
+-
+ 	return ret;
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_object.c b/drivers/gpu/drm/i915/gem/i915_gem_object.c
+index fa1b6dd..e8da93a 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_object.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_object.c
+@@ -1795,8 +1795,6 @@ struct drm_i915_gem_obj_list *i915_window_blt_copy_swapout(struct drm_i915_gem_o
+ 	struct drm_i915_gem_obj_list *obj_tail = NULL;
+ 
+ 	uint32_t idx = atomic_fetch_inc(&g_idx);
+-	uint64_t ts1;
+-	uint64_t ts2;
+ 
+ 	/*
+ 	 * We will handle CCS data only if source
+@@ -1843,8 +1841,6 @@ struct drm_i915_gem_obj_list *i915_window_blt_copy_swapout(struct drm_i915_gem_o
+ 
+ 	spin_unlock(&i915->mm.window_queue.lock);
+ 
+-	ts1 = ktime_get_real_ns();
+-
+ 	intel_engine_pm_get(ce->engine);
+ 
+ 	do {
+@@ -1936,9 +1932,6 @@ request:
+ 
+ 	intel_engine_pm_put(ce->engine);
+ 
+-	ts2 = ktime_get_real_ns();
+-	printk("[swapout] [%d] takes %lld ns size=%lld\n", idx, ts2 - ts1, size);
+-
+ 	spin_lock(&i915->mm.window_queue.lock);
+ 	src_vma->size = BLT_WINDOW_SZ;
+ 	dst_vma->size = BLT_WINDOW_SZ;
+@@ -1979,9 +1972,6 @@ int i915_window_blt_copy_swapin(struct drm_i915_gem_object *dst,
+ 	int err;
+ 
+ 	uint32_t idx = atomic_fetch_inc(&g_idx);
+-	uint64_t ts1;
+-	uint64_t ts2;
+-
+ 
+ 	/*
+ 	 * We will handle CCS data only if source
+@@ -2028,7 +2018,6 @@ int i915_window_blt_copy_swapin(struct drm_i915_gem_object *dst,
+ 
+ 	spin_unlock(&i915->mm.window_queue.lock);
+ 
+-	ts1 = ktime_get_real_ns();
+ 
+ 	intel_engine_pm_get(ce->engine);
+ 
+@@ -2105,9 +2094,6 @@ request:
+ 
+ 	intel_engine_pm_put(ce->engine);
+ 
+-	ts2 = ktime_get_real_ns();
+-	printk("[swapin] [%d] takes %lld ns size=%lld\n", idx, ts2 - ts1, size);
+-
+ 	spin_lock(&i915->mm.window_queue.lock);
+ 	src_vma->size = BLT_WINDOW_SZ;
+ 	dst_vma->size = BLT_WINDOW_SZ;
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_object_types.h b/drivers/gpu/drm/i915/gem/i915_gem_object_types.h
+index 6b6a5b5..8f4939b 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_object_types.h
++++ b/drivers/gpu/drm/i915/gem/i915_gem_object_types.h
+@@ -682,6 +682,7 @@ struct drm_i915_gem_object {
+ 
+ 	struct drm_i915_gem_object *swapto;
+ 	struct drm_i915_gem_obj_list *swapto1;
++	bool suspended;
+ 
+ 	struct {
+ 		spinlock_t lock;
+diff --git a/drivers/gpu/drm/i915/gt/uc/intel_guc_submission.c b/drivers/gpu/drm/i915/gt/uc/intel_guc_submission.c
+index c6833ff..510103a 100644
+--- a/drivers/gpu/drm/i915/gt/uc/intel_guc_submission.c
++++ b/drivers/gpu/drm/i915/gt/uc/intel_guc_submission.c
+@@ -3520,9 +3520,6 @@ static struct i915_sw_fence *guc_context_suspend(struct intel_context *ce,
+ 
+ 	ret = guc_context_block(ce);
+ 
+-	if (!IS_ERR(ret))
+-		i915_send_uevent(ce->engine->gt->i915, "SUSPEND=%d", ce->pid);
+-
+ 	return ret;
+ }
+ 
+@@ -3531,8 +3528,6 @@ static void guc_context_resume(struct intel_context *ce)
+ 	GEM_BUG_ON(!i915_sw_fence_done(&ce->guc_state.blocked));
+ 
+ 	guc_context_unblock(ce);
+-
+-	i915_send_uevent(ce->engine->gt->i915, "RESUME=%d", ce->pid);
+ }
+ 
+ int intel_guc_modify_scheduling(struct intel_guc *guc, bool enable)
+diff --git a/drivers/gpu/drm/i915/i915_drm_client.c b/drivers/gpu/drm/i915/i915_drm_client.c
+index 1cb6c94..dfe9d9f 100644
+--- a/drivers/gpu/drm/i915/i915_drm_client.c
++++ b/drivers/gpu/drm/i915/i915_drm_client.c
+@@ -20,6 +20,7 @@
+ #include "i915_gem.h"
+ #include "i915_utils.h"
+ #include "i915_debugger.h"
++#include "i915_sysfs.h"
+ 
+ struct i915_drm_client_bo {
+ 	struct rb_node node;
+@@ -569,10 +570,37 @@ static void __rcu_i915_drm_client_free(struct work_struct *wrk)
+ 	xa_erase(&client->clients->xarray, client->id);
+ 	pvc_wa_allow_rc6(i915);
+ 	i915_uuid_cleanup(client);
+-
++	
++	
++	
+ 	kfree(client);
+ }
+ 
++static bool
++i915_drm_client_has_client(struct i915_drm_clients *clients,
++		           struct task_struct *task
++		          ) 
++{
++	struct i915_drm_client *client;
++	unsigned long idx;
++	bool found = false;
++	
++	xa_for_each(&clients->xarray, idx, client) {
++		struct task_struct *task_;  
++	
++		if (READ_ONCE(client->closed))
++			continue;
++		
++		task_ = pid_task(i915_drm_client_pid(client), PIDTYPE_PID);
++		if ( task->pid == task_->pid ) {
++			found = true;
++			break;
++		}
++	}
++
++	return found;
++}
++		    		   
+ struct i915_drm_client *
+ i915_drm_client_add(struct i915_drm_clients *clients,
+ 		    struct task_struct *task,
+@@ -582,6 +610,9 @@ i915_drm_client_add(struct i915_drm_clients *clients,
+ 	struct i915_drm_client *client;
+ 	int ret;
+ 
++	if (!i915_drm_client_has_client(clients, task))
++		i915_send_uevent(i915, task, "START", 0, 0);
++	
+ 	client = kzalloc(sizeof(*client), GFP_KERNEL);
+ 	if (!client)
+ 		return ERR_PTR(-ENOMEM);
+@@ -648,7 +679,7 @@ i915_drm_client_update(struct i915_drm_client *client,
+ 		       struct task_struct *task)
+ {
+ 	struct i915_drm_client_name *name;
+-
++	
+ 	name = get_name(client, task);
+ 	if (!name)
+ 		return -ENOMEM;
+diff --git a/drivers/gpu/drm/i915/i915_request.c b/drivers/gpu/drm/i915/i915_request.c
+index b51b270..49faed5 100644
+--- a/drivers/gpu/drm/i915/i915_request.c
++++ b/drivers/gpu/drm/i915/i915_request.c
+@@ -435,9 +435,6 @@ bool i915_request_retire(struct i915_request *rq)
+ 		__i915_request_fill(rq, POISON_FREE);
+ 	rq->ring->head = rq->postfix;
+ 
+-	if (rq->task)
+-		i915_send_uevent(rq->engine->i915, "STOP=%d", rq->task->pid);
+-
+ 	if (!i915_request_signaled(rq)) {
+ 		spin_lock_irq(&rq->lock);
+ 		dma_fence_signal_locked(&rq->fence);
+diff --git a/drivers/gpu/drm/i915/i915_sysfs.c b/drivers/gpu/drm/i915/i915_sysfs.c
+index 0336790..d8bccdb 100644
+--- a/drivers/gpu/drm/i915/i915_sysfs.c
++++ b/drivers/gpu/drm/i915/i915_sysfs.c
+@@ -48,6 +48,8 @@
+ #include "intel_sysfs_mem_health.h"
+ #include "i915_debugger.h"
+ #include "i915_addr_trans_svc.h"
++#include <linux/ktime.h>
++#include <linux/rtc.h>
+ 
+ static ssize_t
+ i915_sysfs_show(struct device *dev, struct device_attribute *attr, char *buf);
+@@ -992,16 +994,29 @@ void i915_teardown_sysfs(struct drm_i915_private *dev_priv)
+ 	kobject_put(dev_priv->sysfs_gt);
+ }
+ 
+-void i915_send_uevent(struct drm_i915_private *i915, const char *fmt, ...)
++void i915_send_uevent(struct drm_i915_private *i915, struct task_struct *task, const char *event, int swap_size,  int swap_time)
+ {
+-	char buf[128];
+-	char *envp[] = {buf, NULL};
+-	va_list ap;
++	char buf[512];
++ 	char *envp[] = {buf, NULL};
+ 
+-	va_start(ap, fmt);
+-	vsprintf(buf, fmt, ap);
+-	va_end(ap);
+-
+-	kobject_uevent_env(&i915->drm.primary->kdev->kobj, KOBJ_CHANGE, envp);
++	ktime_t kt = ktime_get_real();
++	struct rtc_time t = rtc_ktime_to_tm(kt);
++	struct timespec64 ts = ktime_to_timespec64(kt);
++	char swaps[64];
++	
++	if (!task) {
++		task = current;
++	}
++	
++	if (swap_size !=0 ) {
++		sprintf(swaps, "[%d K in %d us]", swap_size, swap_time);
++	}
++	else {
++		sprintf(swaps,"");
++	}
++	
++	sprintf(buf, "%s=[%ptRs.%03i] [%d] [%s] [%d] %s", event, &t, ts.tv_nsec / NSEC_PER_MSEC, task->pid, task->comm, task_nice(task), swaps);
++	 
++ 	kobject_uevent_env(&i915->drm.primary->kdev->kobj, KOBJ_CHANGE, envp);
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/i915_sysfs.h b/drivers/gpu/drm/i915/i915_sysfs.h
+index cc016e6..434e237 100644
+--- a/drivers/gpu/drm/i915/i915_sysfs.h
++++ b/drivers/gpu/drm/i915/i915_sysfs.h
+@@ -14,6 +14,6 @@ struct drm_i915_private *kdev_minor_to_i915(struct device *kdev);
+ void i915_setup_sysfs(struct drm_i915_private *i915);
+ void i915_teardown_sysfs(struct drm_i915_private *i915);
+ 
+-void i915_send_uevent(struct drm_i915_private *i915, const char *fmt, ...);
++void i915_send_uevent(struct drm_i915_private *i915, struct task_struct *task, const char *event, int swap_size, int swap_time);
+ 
+ #endif /* __I915_SYSFS_H__ */
